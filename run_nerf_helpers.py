@@ -75,8 +75,43 @@ class MLP(nn.Module):
     def forward(self, x):
         # Your forward pass implementation here
         return self.mlp
+class SNNMLP(nn.Module):
+    def __init__(self, input_ch, W, D, skips,):#需要的参数
+        super(SNNMLP,self).__init__()
+        #分割图像到指定大小
+        self.patch_embed 
+        #建立网络层
+        self.layers = nn.ModuleList()
+        for layer in range(self.number_layers):
+            layer=BasicLayer()
+            self.layers.append(layer)
+class BasicLayer():
+    def __init__(self) -> None:
+        pass
+class LIFBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        pass
+class LIFModule(nn.Module):
+    def __init__(self, dim, lif_bias=True, proj_drop=0.,
+                 lif=-1, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=-1.):
+        super().__init__()
+        
+        
+
+    def forward(self, x):
+        
+
+        return x
+class PatchMerging(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+class PatchEmbed(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False,norm_layer=nn.LayerNorm, lif_bias=True,lif=-1, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=-1.,drop=0.):
         """ 
         """
         super(NeRF, self).__init__()
@@ -86,7 +121,12 @@ class NeRF(nn.Module):
         self.input_ch_views = input_ch_views
         self.skips = skips
         self.use_viewdirs = use_viewdirs
+        self.norm = norm_layer(input_ch)
         self.pts_linears = MLP(input_ch, W, D, skips)
+        self.lif_module = LIFModule(input_ch, lif_bias=lif_bias, proj_drop=drop,
+                               lif=lif, lif_fix_tau=lif_fix_tau, lif_fix_vth=lif_fix_vth,
+                               lif_init_tau=lif_init_tau, lif_init_vth=lif_init_vth)
+        # self.norm1 = norm_layer(input_ch)
         # self.pts_linears = nn.ModuleList(
         #     [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
@@ -107,11 +147,15 @@ class NeRF(nn.Module):
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         h = input_pts
+        h = self.norm(h)
+        # h = self.lif_module(x)
         for i, l in enumerate(self.pts_linears.mlp):
+
             h = self.pts_linears.mlp[i](h)
             h = F.relu(h)
             if i in self.skips:
                 h = torch.cat([input_pts, h], -1)
+        
 
         if self.use_viewdirs:
             alpha = self.alpha_linear(h)
