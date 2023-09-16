@@ -3,8 +3,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_ 
+# from .snn_cuda import LIFSpike
+from torch.autograd import Function
+import torch
+from torch.nn.modules.utils import _pair
+import torch.nn.functional as F
+import torch.nn as nn
 
-
+from collections import namedtuple
+import cupy
+from string import Template
+import math
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
@@ -64,8 +74,94 @@ def get_embedder(multires, i=0):
 
 
 # Model
+class MLP(nn.Module):
+    def __init__(self, input_ch, W, D, skips):
+        super(MLP, self).__init__()
+        self.skips = skips
+        self.mlp = nn.ModuleList(
+            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)]
+        )
+
+    def forward(self, x):
+        # Your forward pass implementation here
+        return self.mlp
+
+class LIFModule(nn.Module):
+    def __init__(self, dim, lif_bias=True, proj_drop=0.,
+                 lif=4, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=0.1):
+        super().__init__()
+        self.dim = dim
+        self.lif = lif
+        self.fn1=nn.Conv2d(dim, dim, 1, 1, 0, groups=1, bias=lif_bias)
+        self.fn2=nn.Conv2d(dim, dim, 1, 1, 0, groups=1, bias=lif_bias)
+        self.fn3=nn.Conv2d(dim, dim, 1, 1, 0, groups=1, bias=lif_bias)
+        self.fn4= nn.Conv2d(dim, dim, 1, 1, 0, groups=1, bias=lif_bias)
+        self.fn5= nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, bias=lif_bias)
+        self.actn = F.relu
+        self.norm1= MyNorm(dim)
+        self.norm2= MyNorm(dim)
+        self.norm3= MyNorm(dim)
+        self.lif1 = LIFSpike(lif=lif, fix_tau=lif_fix_tau, fix_vth=lif_fix_vth,
+                               init_tau=lif_init_tau, init_vth=lif_init_vth, dim=2)
+        self.lif2 = LIFSpike(lif=lif, fix_tau=lif_fix_tau, fix_vth=lif_fix_vth,
+                               init_tau=lif_init_tau, init_vth=lif_init_vth, dim=3)
+            
+        
+
+    def forward(self, x):
+        # print(x.shape)
+        # x=self.fn1(x)
+        # # print("fn1")
+        # # print(x.shape)
+        # x=self.norm1(x)
+        # x= self.actn(x)
+        # x = self.fn5(x)
+        # x = self.norm2(x)
+        # x = self.actn(x)
+        x_lr = self.lif1(x)
+        # x_lr = x
+        # x_td = x
+        x_td = self.lif2(x)
+        # x_lr = self.fn3(x_lr)
+        # x_td = self.fn4(x_td)
+        # x_lr = self.actn(x_lr)
+        # x_td = self.actn(x_td)
+        x = x_lr + x_td
+        x = self.norm3(x)
+        # x = self.fn2(x)
+        return x
+class PatchMerging(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+class PatchEmbed(nn.Module):
+    
+    def __init__(self) -> None:
+        super().__init__()
+class  LIFSpike(nn.Module):
+    def __init__(self,
+                 lif, fix_tau=False, fix_vth=False, init_tau=0.25, init_vth=-1., dim=2):
+        super(LIFSpike, self).__init__()
+        self.lif = lif
+        self.dim = dim
+        if fix_tau:
+            self.tau = init_tau
+        else:
+            self.tau = torch.nn.Parameter(torch.Tensor([init_tau]))
+        if fix_vth:
+            self.Vth = init_vth
+        else:
+            self.Vth = torch.nn.Parameter(torch.Tensor([init_vth]))
+        assert dim == 2 or dim == 3
+
+    def forward(self, x):
+        if self.lif == -1:
+            return x
+        out = _lif_cuda(x, self.tau, self.Vth, self.lif, self.dim)
+        return out
+def MyNorm(dim):
+    return nn.GroupNorm(1, dim)      
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False,norm_layer=nn.LayerNorm, lif_bias=True,lif=4, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=0.1,drop=0.3):
         """ 
         """
         super(NeRF, self).__init__()
@@ -75,9 +171,19 @@ class NeRF(nn.Module):
         self.input_ch_views = input_ch_views
         self.skips = skips
         self.use_viewdirs = use_viewdirs
-        
-        self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
+        self.norm = norm_layer(input_ch)
+        self.pts_linears = MLP(input_ch, W, D, skips)
+        self.lif_module = LIFModule(input_ch, lif_bias=lif_bias, proj_drop=drop,
+                               lif=lif, lif_fix_tau=lif_fix_tau, lif_fix_vth=lif_fix_vth,
+                               lif_init_tau=lif_init_tau, lif_init_vth=lif_init_vth)
+        self.lif_module2 = LIFModule(W, lif_bias=lif_bias, proj_drop=drop,
+                               lif=lif, lif_fix_tau=lif_fix_tau, lif_fix_vth=lif_fix_vth,
+                               lif_init_tau=lif_init_tau, lif_init_vth=lif_init_vth)
+        self.drop_path=DropPath(drop)
+        self.norm1 = norm_layer(W)
+        self.norm2 = norm_layer(W//2)
+        # self.pts_linears = nn.ModuleList(
+        #     [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
@@ -88,33 +194,87 @@ class NeRF(nn.Module):
         
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
+            
             self.alpha_linear = nn.Linear(W, 1)
+            # print(self.alpha_linea .shape+"alpha_linear ")
             self.rgb_linear = nn.Linear(W//2, 3)
+            # print(self.rgb_linear.shape+"rgb_linear alpha_linear")
+
         else:
             self.output_linear = nn.Linear(W, output_ch)
+            # print(self.output_linear.shape)
+            # print("output_linear.shape")
+            
 
     def forward(self, x):
+        # print("x.shape")
+        # print(x.shape)
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         h = input_pts
-        for i, l in enumerate(self.pts_linears):
-            h = self.pts_linears[i](h)
+        h = self.norm(h)
+        # print("h.shape")
+        # print(h.shape)#torch.Size([65536, 63])
+        H=h.shape[0]
+        # print(H)
+        W=h.shape[1]
+        # print(W)
+        h = h.reshape(H,W,1,1)
+        # print(h.shape)
+        h = self.lif_module(h)
+        # print("lif_module(h)")
+        # print(h.shape)
+        
+        h = h.reshape(H,W)
+        h = h + self.drop_path(h)
+        # print(h.shape)
+        # print("------------------------")[65535,63]
+        for i, l in enumerate(self.pts_linears.mlp):
+            
+
+            h = self.pts_linears.mlp[i](h)
+            # print("h.shape")
+            # print(h.shape) #(65526,256)
+            # print("------------------------")
+            h = self.norm1(h)
+            H=h.shape[0]
+        # print(H)
+            W=h.shape[1]
+        # print(W)
+            h = h.reshape(H,W,1,1)
+            h = self.lif_module2(h)
+            h = h.reshape(H,W)
             h = F.relu(h)
             if i in self.skips:
+                
                 h = torch.cat([input_pts, h], -1)
+        h = h+self.drop_path(h)
+        
 
         if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
-            feature = self.feature_linear(h)
-            h = torch.cat([feature, input_views], -1)
+            H=h
+
+            alpha=self.norm1(H)
+            alpha = self.alpha_linear(H)
+            # print(alpha.shape)
+            # print("alpha.shape")[65535,1]
+            feature = self.feature_linear(H)
+            # print(feature.shape)
+            # print("feature_linear.shape")[65535,256]
+            H = torch.cat([feature, input_views], -1)
         
             for i, l in enumerate(self.views_linears):
-                h = self.views_linears[i](h)
-                h = F.relu(h)
-
-            rgb = self.rgb_linear(h)
+                H = self.views_linears[i](H)
+                H = F.relu(H)
+            H = self.norm2(H)
+            H = H+self.drop_path(H)
+            rgb = self.rgb_linear(H)##
             outputs = torch.cat([rgb, alpha], -1)
+            # print(rgb.shape)
+            # print("rgb.shape")[65535,3]
         else:
             outputs = self.output_linear(h)
+            # print(outputs.shape)
+            # print("outputs.shape")#[65535,]
 
         return outputs    
 
@@ -237,3 +397,361 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
     return samples
+# 2022.06.27-Changed for building SNN-MLP
+#            Huawei Technologies Co., Ltd. <foss@huawei.com>
+
+
+Stream = namedtuple('Stream', ['ptr'])
+
+
+def Dtype(t):
+    if isinstance(t, torch.cuda.FloatTensor):
+        return 'float'
+    elif isinstance(t, torch.cuda.DoubleTensor):
+        return 'double'
+
+
+@cupy._util.memoize(for_each_device=True)
+def load_kernel(kernel_name, code, **kwargs):
+    code = Template(code).substitute(**kwargs)
+    kernel_code = cupy.cuda.compile_with_cache(code)
+    return kernel_code.get_function(kernel_name)
+
+
+CUDA_NUM_THREADS = 1024
+
+kernel_loop = '''
+#define CUDA_KERNEL_LOOP(i, n)                        \
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; \
+      i < (n);                                       \
+      i += blockDim.x * gridDim.x)
+'''
+
+
+def GET_BLOCKS(N):
+    return (N + CUDA_NUM_THREADS - 1) // CUDA_NUM_THREADS
+
+
+_lif_kernel_h = kernel_loop + '''
+extern "C"
+__global__ void lif_forward_kernel_h(
+const ${Dtype}* bottom_data, const ${Dtype}* tau, const ${Dtype}* vth, ${Dtype}* top_data, bool* flag, ${Dtype}* o) {
+  CUDA_KERNEL_LOOP(index, ${nthreads}) {
+    const int s = ${lif};
+    const int lifh = (${height} + s - 1) / s;
+    const int lifhh = ${height} / s;
+    const int n = index / ${channels} / lifh / ${width};
+    const int c = (index / lifh / ${width}) % ${channels};
+    const int h = (index / ${width}) % lifh;
+    const int w = index % ${width};
+
+    ${Dtype} u = 0;
+
+    const int offset = ((n * ${channels} + c) * ${height} + h * s) * ${width} + w;
+    for(int j = 0; j < s; j++) {
+      const int toffset = offset + j * ${width};
+      if(toffset < ${numel} && h * s + j < lifhh * s) {
+        u = tau[0] * o[toffset] + bottom_data[toffset];
+        flag[toffset] = u > vth[0];
+        if(j < s - 1)
+          o[toffset + ${width}] = flag[toffset] ? 0 : u;
+        top_data[toffset] = flag[toffset] ? u : vth[0];
+      } else if(toffset < ${numel} && h * s + j < ${height}) {
+        flag[toffset] = 1;
+        top_data[toffset] = bottom_data[toffset];
+      }
+    }
+  }
+}
+'''
+
+_lif_kernel_w = kernel_loop + '''
+extern "C"
+__global__ void lif_forward_kernel_w(
+const ${Dtype}* bottom_data, const ${Dtype}* tau, const ${Dtype}* vth, ${Dtype}* top_data, bool* flag, ${Dtype}* o) {
+  CUDA_KERNEL_LOOP(index, ${nthreads}) {
+    const int s = ${lif};
+    const int lifw = (${width} + s - 1) / s;
+    const int lifww = ${width} / s;
+    const int n = index / ${channels} / ${height} / lifw;
+    const int c = (index / ${height} / lifw) % ${channels};
+    const int h = (index / lifw) % ${height};
+    const int w = index % lifw;
+
+    ${Dtype} u = 0;
+
+    const int offset = ((n * ${channels} + c) * ${height} + h) * ${width} + w * s;
+    for(int j = 0; j < s; j++) {
+      const int toffset = offset + j;
+      if(toffset < ${numel} && w * s + j < lifww * s) {
+        u = tau[0] * o[toffset] + bottom_data[toffset];
+        flag[toffset] = u > vth[0];
+        if(j < s - 1)
+          o[toffset + 1] = flag[toffset] ? 0 : u;
+        top_data[toffset] = flag[toffset] ? u : vth[0];
+      } else if(toffset < ${numel} && w * s + j < ${width}) {
+        flag[toffset] = 1;
+        top_data[toffset] = bottom_data[toffset];
+      }
+    }
+  }
+}
+'''
+
+_lif_kernel_backward_grad_input_h = kernel_loop + '''
+extern "C"
+__global__ void lif_backward_grad_input_kernel_h(
+    const ${Dtype}* const top_diff, const ${Dtype}* const tau, const ${Dtype}* const flag, const ${Dtype}* const tmpo, ${Dtype}* const bottom_diff, ${Dtype}* const tau_diff) {
+  CUDA_KERNEL_LOOP(index, ${nthreads}) {
+    const int s = ${lif};
+    const int lifh = (${height} + s - 1) / s;
+    const int lifhh = ${height} / s;
+    const int n = index / ${channels} / lifh / ${width};
+    const int c = (index / lifh / ${width}) % ${channels};
+    const int h = (index / ${width}) % lifh;
+    const int w = index % ${width};
+
+    ${Dtype} tmp_bottom[${lif}];
+    ${Dtype} tmp_tau[${lif}];
+    
+    const int offset = ((n * ${channels} + c) * ${height} + h * s) * ${width} + w;
+    for(int j = 0; j < s; j++) {
+      const int toffset = offset + j * ${width};
+      if(toffset < ${numel} && h * s + j < lifhh * s) {
+        tmp_bottom[j] = flag[toffset] * top_diff[toffset];
+        if(j == 0) {
+          tmp_tau[j] = 0;
+        } else {
+          tmp_tau[j] = tmp_tau[j - 1] * tau[0] * (1 - flag[toffset - ${width}]) + tmpo[toffset];
+        }
+        tau_diff[toffset] = top_diff[toffset] * flag[toffset] * tmp_tau[j];
+      }
+    }
+    if(offset + (s - 1) * ${width} < ${numel} && h * s + s - 1 < lifhh * s)
+      bottom_diff[offset + (s - 1) * ${width}] = tmp_bottom[s - 1];
+    for(int j = s - 2; j >= 0; j--) {
+      const int toffset = offset + j * ${width};
+      if(toffset + ${width} < ${numel} && h * s + j + 1 < lifhh * s) {
+        tmp_bottom[j] += tmp_bottom[j + 1] * (1 - flag[toffset]) * tau[0];
+        bottom_diff[toffset] = tmp_bottom[j];
+      } if(toffset < ${numel} && h * s + j < lifhh * s) {
+        bottom_diff[toffset] = tmp_bottom[j];
+      } else if(toffset < ${numel} && h * s + j < ${height}) {
+        bottom_diff[toffset] = top_diff[toffset];
+      }
+    }
+  }
+}
+'''
+
+_lif_kernel_backward_grad_input_w = kernel_loop + '''
+extern "C"
+__global__ void lif_backward_grad_input_kernel_w(
+    const ${Dtype}* const top_diff, const ${Dtype}* const tau, const ${Dtype}* const flag, const ${Dtype}* const tmpo, ${Dtype}* const bottom_diff, ${Dtype}* const tau_diff) {
+  CUDA_KERNEL_LOOP(index, ${nthreads}) {
+    const int s = ${lif};
+    const int lifw = (${width} + s - 1) / s;
+    const int lifww = ${width} / s;
+    const int n = index / ${channels} / ${height} / lifw;
+    const int c = (index / ${height} / lifw) % ${channels};
+    const int h = (index / lifw) % ${height};
+    const int w = index % lifw;
+
+    ${Dtype} tmp_bottom[${lif}];
+    ${Dtype} tmp_tau[${lif}];
+
+    const int offset = ((n * ${channels} + c) * ${height} + h) * ${width} + w * s;
+    for(int j = 0; j < s; j++) {
+      const int toffset = offset + j;
+      if(toffset < ${numel} && w * s + j < lifww * s) {
+        tmp_bottom[j] = flag[toffset] * top_diff[toffset];
+        if(j == 0) {
+          tmp_tau[j] = 0;
+        } else {
+          tmp_tau[j] = tmp_tau[j - 1] * tau[0] * (1 - flag[toffset - 1]) + tmpo[toffset];
+        }
+        tau_diff[toffset] = top_diff[toffset] * flag[toffset] * tmp_tau[j];
+      }
+    }
+    if(offset + s - 1 < ${numel} && w * s + s - 1 < lifww * s)
+        bottom_diff[offset + s - 1] = tmp_bottom[s - 1];
+    for(int j = s - 2; j >= 0; j--) {
+      const int toffset = offset + j;
+      if(toffset + 1 < ${numel} && w * s + j + 1 < lifww * s) {
+        tmp_bottom[j] += tmp_bottom[j + 1] * (1 - flag[toffset]) * tau[0];
+        bottom_diff[toffset] = tmp_bottom[j];
+      } else if(toffset < ${numel} && w * s + j < lifww * s) {
+        bottom_diff[toffset] = tmp_bottom[j];
+      } else if(toffset < ${numel} && w * s + j < ${width}) {
+        bottom_diff[toffset] = top_diff[toffset];
+      }
+    }
+  }
+}
+'''
+
+class _lif_h(Function):
+    @staticmethod
+    def forward(ctx, input, tau, vth, lif, dim):
+        assert input.dim() == 4 and input.is_cuda
+        batch_size, channels, height, width = input.size()
+
+        output = torch.zeros_like(input)#input.new(batch_size, channels, height, width)
+        flag = torch.zeros_like(input).type(torch.bool)#input.new(batch_size, channels, height, width).type(torch.bool)
+        tmpo = torch.zeros_like(input)#input.new(batch_size, channels, height, width)
+
+        n = batch_size * channels * int(math.ceil(height / lif)) * width
+
+        with torch.cuda.device_of(input):
+            f = load_kernel('lif_forward_kernel_h', _lif_kernel_h, Dtype=Dtype(input), nthreads=n,
+                            num=batch_size, channels=channels, 
+                            height=height, width=width,
+                            lif=lif, numel=output.numel()
+                            )
+            f(block=(CUDA_NUM_THREADS,1,1),
+              grid=(GET_BLOCKS(n),1,1),
+              args=[input.data_ptr(), tau.data_ptr(), vth.data_ptr(), output.data_ptr(), flag.data_ptr(), tmpo.data_ptr()],
+              stream=Stream(ptr=torch.cuda.current_stream().cuda_stream))
+
+        ctx.save_for_backward(input, tau, vth, flag, tmpo)
+        ctx.lif, ctx.dim = lif, dim
+        return output
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        assert grad_output.is_cuda
+        if not grad_output.is_contiguous():
+            grad_output = grad_output.contiguous()
+        input, tau, vth, flag, tmpo = ctx.saved_tensors
+        flag = flag.type(input.dtype)
+        lif, dim = ctx.lif, ctx.dim
+        batch_size, channels, height, width = input.size()
+
+        grad_input = None
+        grad_tau = None
+        grad_vth = None
+        n = batch_size * channels * int(math.ceil(height / lif)) * width
+
+        opt = dict(Dtype=Dtype(grad_output),
+                   num=batch_size, channels=channels,
+                   height=height, width=width, nthreads=n, numel=grad_output.numel(),
+                   lif=lif
+              )
+        with torch.cuda.device_of(input):
+            if ctx.needs_input_grad[0]:
+                grad_vth = ((1. - flag) * grad_output).sum().unsqueeze(0).contiguous()
+                grad_input = torch.zeros_like(input)#input.new(input.size())
+                grad_tau = torch.zeros_like(input)#input.new(input.size())
+
+                f = load_kernel('lif_backward_grad_input_kernel_h',
+                                _lif_kernel_backward_grad_input_h, **opt)
+                f(block=(CUDA_NUM_THREADS,1,1),
+                  grid=(GET_BLOCKS(n),1,1),
+                  args=[grad_output.data_ptr(), tau.data_ptr(), flag.data_ptr(), tmpo.data_ptr(), grad_input.data_ptr(), grad_tau.data_ptr()],
+                  stream=Stream(ptr=torch.cuda.current_stream().cuda_stream))
+                grad_tau = grad_tau.sum().unsqueeze(0).contiguous()
+        return grad_input, grad_tau, grad_vth, None, None
+    
+
+class _lif_w(Function):
+    @staticmethod
+    def forward(ctx, input, tau, vth, lif, dim):
+        assert input.dim() == 4 and input.is_cuda
+        batch_size, channels, height, width = input.size()
+
+        output = torch.zeros_like(input)
+        flag = torch.zeros_like(input).type(torch.bool)
+        tmpo = torch.zeros_like(input)
+
+        n = batch_size * channels * int(math.ceil(width / lif)) * height
+
+        with torch.cuda.device_of(input):
+            f = load_kernel('lif_forward_kernel_w', _lif_kernel_w, Dtype=Dtype(input), nthreads=n,
+                            num=batch_size, channels=channels, 
+                            height=height, width=width,
+                            lif=lif, numel=output.numel()
+                            )
+
+            f(block=(CUDA_NUM_THREADS,1,1),
+              grid=(GET_BLOCKS(n),1,1),
+              args=[input.data_ptr(), tau.data_ptr(), vth.data_ptr(), output.data_ptr(), flag.data_ptr(), tmpo.data_ptr()],
+              stream=Stream(ptr=torch.cuda.current_stream().cuda_stream))
+
+        ctx.save_for_backward(input, tau, vth, flag, tmpo)
+        ctx.lif, ctx.dim = lif, dim
+        return output
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        assert grad_output.is_cuda
+        if not grad_output.is_contiguous():
+            grad_output = grad_output.contiguous()
+        input, tau, vth, flag, tmpo = ctx.saved_tensors
+        flag = flag.type(input.dtype)
+        lif, dim = ctx.lif, ctx.dim
+        batch_size, channels, height, width = input.size()
+
+        grad_input = None
+        grad_tau = None
+        grad_vth = None
+        n = batch_size * channels * int(math.ceil(width / lif)) * height
+
+        opt = dict(Dtype=Dtype(grad_output),
+                   num=batch_size, channels=channels,
+                   height=height, width=width, nthreads=n, numel=grad_output.numel(),
+                   lif=lif
+              )
+        with torch.cuda.device_of(input):
+            if ctx.needs_input_grad[0]:
+                grad_vth = ((1. - flag) * grad_output).sum().unsqueeze(0).contiguous()
+                grad_input = torch.zeros_like(input)#input.new(input.size())
+                grad_tau = torch.zeros_like(input)#input.new(input.size())
+                f = load_kernel('lif_backward_grad_input_kernel_w',
+                                _lif_kernel_backward_grad_input_w, **opt)
+                f(block=(CUDA_NUM_THREADS,1,1),
+                  grid=(GET_BLOCKS(n),1,1),
+                  args=[grad_output.data_ptr(), tau.data_ptr(), flag.data_ptr(), tmpo.data_ptr(), grad_input.data_ptr(), grad_tau.data_ptr()],
+                  stream=Stream(ptr=torch.cuda.current_stream().cuda_stream))
+                grad_tau = grad_tau.sum().unsqueeze(0).contiguous()
+        return grad_input, grad_tau, grad_vth, None, None
+
+
+def _lif_cuda(input, tau, vth, lif, dim):
+    """ involution kernel
+    """
+    assert dim == 2 or dim == 3
+
+    if input.is_cuda:
+        if dim == 2:
+            out = _lif_h.apply(input, tau, vth, lif, dim)
+        elif dim == 3:
+            out = _lif_w.apply(input, tau, vth, lif, dim)
+    else:
+        raise NotImplementedError
+    return out
+
+
+class LIFSpike(nn.Module):
+    def __init__(self,
+                 lif, fix_tau=False, fix_vth=False, init_tau=0.25, init_vth=-1., dim=2):
+        super(LIFSpike, self).__init__()
+        self.lif = lif
+        self.dim = dim
+        if fix_tau:
+            self.tau = init_tau
+        else:
+            self.tau = torch.nn.Parameter(torch.Tensor([init_tau]))
+        if fix_vth:
+            self.Vth = init_vth
+        else:
+            self.Vth = torch.nn.Parameter(torch.Tensor([init_vth]))
+        assert dim == 2 or dim == 3
+
+    def forward(self, x):
+        if self.lif == -1:
+            return x
+        out = _lif_cuda(x, self.tau, self.Vth, self.lif, self.dim)
+        return out
+
+
+
