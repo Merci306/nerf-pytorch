@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
-
+import pynvml
 import matplotlib.pyplot as plt
-
+import psutil
 from run_nerf_helpers import *
 
 from load_llff import load_llff_data
@@ -826,7 +826,31 @@ def train():
 
     
         if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            import pynvml
+
+            pynvml.nvmlInit()
+
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)    # 指定GPU的id
+            meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+
+            # print(meminfo.used / 1024**2)
+            # print(meminfo.free / 1024**2)
+            total_memory, used_memory, free_memory = map(
+            int, os.popen('free -t -m').readlines()[-1].split()[1:])
+            
+
+
+            # Getting loadover15 minutes
+            load1, load5, load15 = psutil.getloadavg()
+
+            cpu_usage = (load15/os.cpu_count()) * 100
+
+            # print("The CPU usage is : ", cpu_usage)
+
+            # Memory usage
+            # print("RAM memory % used:", round((used_memory/total_memory) * 100, 2))
+
+            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()} GPU:{meminfo.used / 1024**2}MB RAM {used_memory}MB CPU:{cpu_usage}%")
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
