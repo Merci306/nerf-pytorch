@@ -128,7 +128,7 @@ class PatchEmbed(nn.Module):
         super().__init__()
 class  LIFSpike(nn.Module):
     def __init__(self,
-                 lif, fix_tau=False, fix_vth=False, init_tau=0.25, init_vth=-1., dim=2):
+                 lif=4, fix_tau=False, fix_vth=False, init_tau=0.25, init_vth=-1., dim=2):
         super(LIFSpike, self).__init__()
         self.lif = lif
         self.dim = dim
