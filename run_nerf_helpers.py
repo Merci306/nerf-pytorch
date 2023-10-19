@@ -231,20 +231,20 @@ class NeRF(nn.Module):
         # print("------------------------")[65535,63]
         print(h.shape)
         print("---start---")
-        # for i, l in enumerate(self.pts_linears.mlp):
+        for i, l in enumerate(self.pts_linears.mlp):
             
 
-        #     h = self.pts_linears.mlp[i](h)
-        #     # print("h.shape")
-        #     # print(h.shape) #(65526,256)
-        #     # print("------------------------")
-        #     h = self.norm1(h)
-        #     # h = self.lif_module2(h)
-        #     h = F.relu(h)
+            h = self.pts_linears.mlp[i](h)
+            # print("h.shape")
+            # print(h.shape) #(65526,256)
+            # print("------------------------")
+            h = self.norm1(h)
+            # h = self.lif_module2(h)
+            h = F.relu(h)
             
-        #     if i in self.skips:
+            if i in self.skips:
                 
-        #         h = torch.cat([input_pts, h], -1)
+                h = torch.cat([input_pts, h], -1)
         print(h.shape)
         print("---end---")
         h = h+self.drop_path(h)
