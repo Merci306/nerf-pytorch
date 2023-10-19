@@ -79,7 +79,7 @@ class MLP(nn.Module):
 
 class LIFModule(nn.Module):
     def __init__(self, dim, lif_bias=True, proj_drop=0.,
-                 lif=-1, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=-1.):
+                 lif=4, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=-1.):
         super().__init__()
         self.dim = dim
         self.lif = lif
