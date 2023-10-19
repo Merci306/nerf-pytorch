@@ -5,7 +5,16 @@ import torch.nn.functional as F
 import numpy as np
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_ 
 # from .snn_cuda import LIFSpike
+from torch.autograd import Function
+import torch
+from torch.nn.modules.utils import _pair
+import torch.nn.functional as F
+import torch.nn as nn
 
+from collections import namedtuple
+import cupy
+from string import Template
+import math
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
@@ -79,17 +88,16 @@ class MLP(nn.Module):
 
 class LIFModule(nn.Module):
     def __init__(self, dim, lif_bias=True, proj_drop=0.,
-                 lif=4, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=-1.):
+                 lif=4, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=0.1):
         super().__init__()
         self.dim = dim
         self.lif = lif
-        self.fn1=nn.Linear(dim,dim,bias=lif_bias)
-        self.fn2=nn.Linear(dim,dim,bias=lif_bias)
-        self.fn3=nn.Linear(dim,dim,bias=lif_bias)
-        self.fn4= nn.Linear(dim,dim,bias=lif_bias)
-        self.fn4= nn.Linear(dim,dim,bias=lif_bias)
-        self.fn5= nn.Linear(dim,dim,bias=lif_bias)
-        self.actn = nn.GELU()
+        self.fn1=nn.Conv2d(dim, dim, 1, 1, 0, groups=1, bias=lif_bias)
+        self.fn2=nn.Conv2d(dim, dim, 1, 1, 0, groups=1, bias=lif_bias)
+        self.fn3=nn.Conv2d(dim, dim, 1, 1, 0, groups=1, bias=lif_bias)
+        self.fn4= nn.Conv2d(dim, dim, 1, 1, 0, groups=1, bias=lif_bias)
+        self.fn5= nn.Conv2d(dim, dim, 3, 1, 1, groups=dim, bias=lif_bias)
+        self.actn = F.relu
         self.norm1= MyNorm(dim)
         self.norm2= MyNorm(dim)
         self.norm3= MyNorm(dim)
@@ -101,15 +109,19 @@ class LIFModule(nn.Module):
         
 
     def forward(self, x):
+        # print(x.shape)
         x=self.fn1(x)
+        # print("fn1")
+        # print(x.shape)
         x=self.norm1(x)
         x= self.actn(x)
-        x = self.fn2(x)
+        x = self.fn5(x)
         x = self.norm2(x)
         x = self.actn(x)
+        
+        x_lr = x
+        x_td = x
         x_lr = self.lif1(x)
-        # x_lr = x
-        # x_td = x
         x_td = self.lif2(x)
         x_lr = self.fn3(x_lr)
         x_td = self.fn4(x_td)
@@ -117,7 +129,7 @@ class LIFModule(nn.Module):
         x_td = self.actn(x_td)
         x = x_lr + x_td
         x = self.norm3(x)
-        x = self.fn5(x)
+        x = self.fn2(x)
         return x
 class PatchMerging(nn.Module):
     def __init__(self) -> None:
@@ -128,7 +140,7 @@ class PatchEmbed(nn.Module):
         super().__init__()
 class  LIFSpike(nn.Module):
     def __init__(self,
-                 lif=4, fix_tau=False, fix_vth=False, init_tau=0.25, init_vth=-1., dim=2):
+                 lif, fix_tau=False, fix_vth=False, init_tau=0.25, init_vth=-1., dim=2):
         super(LIFSpike, self).__init__()
         self.lif = lif
         self.dim = dim
@@ -150,7 +162,7 @@ class  LIFSpike(nn.Module):
 def MyNorm(dim):
     return nn.GroupNorm(1, dim)      
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False,norm_layer=nn.LayerNorm, lif_bias=True,lif=-1, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=-1.,drop=0.):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False,norm_layer=nn.LayerNorm, lif_bias=True,lif=4, lif_fix_tau=False, lif_fix_vth=False, lif_init_tau=0.25, lif_init_vth=0.1,drop=0.3):
         """ 
         """
         super(NeRF, self).__init__()
@@ -165,7 +177,12 @@ class NeRF(nn.Module):
         self.lif_module = LIFModule(input_ch, lif_bias=lif_bias, proj_drop=drop,
                                lif=lif, lif_fix_tau=lif_fix_tau, lif_fix_vth=lif_fix_vth,
                                lif_init_tau=lif_init_tau, lif_init_vth=lif_init_vth)
-        # self.norm1 = norm_layer(input_ch)
+        self.lif_module2 = LIFModule(W, lif_bias=lif_bias, proj_drop=drop,
+                               lif=lif, lif_fix_tau=lif_fix_tau, lif_fix_vth=lif_fix_vth,
+                               lif_init_tau=lif_init_tau, lif_init_vth=lif_init_vth)
+        self.drop_path=DropPath(drop)
+        self.norm1 = norm_layer(W)
+        self.norm2 = norm_layer(W//2)
         # self.pts_linears = nn.ModuleList(
         #     [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
@@ -178,37 +195,86 @@ class NeRF(nn.Module):
         
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
+            
             self.alpha_linear = nn.Linear(W, 1)
+            # print(self.alpha_linea .shape+"alpha_linear ")
             self.rgb_linear = nn.Linear(W//2, 3)
+            # print(self.rgb_linear.shape+"rgb_linear alpha_linear")
+
         else:
             self.output_linear = nn.Linear(W, output_ch)
+            # print(self.output_linear.shape)
+            # print("output_linear.shape")
+            
 
     def forward(self, x):
+        # print("x.shape")
+        # print(x.shape)
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         h = input_pts
         h = self.norm(h)
+        # print("h.shape")
+        # print(h.shape)#torch.Size([65536, 63])
+        H=h.shape[0]
+        # print(H)
+        W=h.shape[1]
+        # print(W)
+        h = h.reshape(H,W,1,1)
+        # print(h.shape)
         h = self.lif_module(h)
-        for i, l in enumerate(self.pts_linears.mlp):
+        # print("lif_module(h)")
+        # print(h.shape)
+        
+        h = h.reshape(H,W)
+        h = h + self.drop_path(h)
+        # print(h.shape)
+        # print("------------------------")[65535,63]
+        print(h.shape)
+        print("---start---")
+        # for i, l in enumerate(self.pts_linears.mlp):
+            
 
-            h = self.pts_linears.mlp[i](h)
-            h = F.relu(h)
-            if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
+        #     h = self.pts_linears.mlp[i](h)
+        #     # print("h.shape")
+        #     # print(h.shape) #(65526,256)
+        #     # print("------------------------")
+        #     h = self.norm1(h)
+        #     # h = self.lif_module2(h)
+        #     h = F.relu(h)
+            
+        #     if i in self.skips:
+                
+        #         h = torch.cat([input_pts, h], -1)
+        print(h.shape)
+        print("---end---")
+        h = h+self.drop_path(h)
         
 
         if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
-            feature = self.feature_linear(h)
-            h = torch.cat([feature, input_views], -1)
+            H=h
+
+            alpha=self.norm1(H)
+            alpha = self.alpha_linear(H)
+            # print(alpha.shape)
+            # print("alpha.shape")[65535,1]
+            feature = self.feature_linear(H)
+            # print(feature.shape)
+            # print("feature_linear.shape")[65535,256]
+            H = torch.cat([feature, input_views], -1)
         
             for i, l in enumerate(self.views_linears):
-                h = self.views_linears[i](h)
-                h = F.relu(h)
-
-            rgb = self.rgb_linear(h)
+                H = self.views_linears[i](H)
+                H = F.relu(H)
+            H = self.norm2(H)
+            H = H+self.drop_path(H)
+            rgb = self.rgb_linear(H)##
             outputs = torch.cat([rgb, alpha], -1)
+            # print(rgb.shape)
+            # print("rgb.shape")[65535,3]
         else:
             outputs = self.output_linear(h)
+            # print(outputs.shape)
+            # print("outputs.shape")#[65535,]
 
         return outputs    
 
@@ -333,16 +399,7 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     return samples
 # 2022.06.27-Changed for building SNN-MLP
 #            Huawei Technologies Co., Ltd. <foss@huawei.com>
-from torch.autograd import Function
-import torch
-from torch.nn.modules.utils import _pair
-import torch.nn.functional as F
-import torch.nn as nn
 
-from collections import namedtuple
-import cupy
-from string import Template
-import math
 
 Stream = namedtuple('Stream', ['ptr'])
 
